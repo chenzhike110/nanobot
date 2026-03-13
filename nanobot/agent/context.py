@@ -10,6 +10,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.media.assets import MediaAsset, MediaInput, filter_media_by_purpose, normalize_media_items
 from nanobot.utils.helpers import build_assistant_message, detect_image_mime
 
 
@@ -18,6 +19,8 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
+    _MAX_INLINE_IMAGES = 3
+    _MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -123,7 +126,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         history: list[dict[str, Any]],
         current_message: str,
         skill_names: list[str] | None = None,
-        media: list[str] | None = None,
+        media: list[MediaInput] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -144,13 +147,82 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             {"role": "user", "content": merged},
         ]
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+    def build_media_followup_message(
+        self,
+        prompt: str,
+        media: list[MediaInput] | None,
+        *,
+        source: str = "tool",
+    ) -> dict[str, Any]:
+        """Build a synthetic user follow-up message for tool-generated media."""
+        content = self._build_user_content(prompt, media, source=source)
+        return {"role": "user", "content": content}
+
+    @staticmethod
+    def _describe_asset(asset: MediaAsset) -> str:
+        label = asset.caption or asset.vision_summary or asset.ocr_text or asset.id
+        return f"{asset.id} ({label})"
+
+    def _select_inline_assets(self, media: list[MediaInput] | None, *, source: str) -> tuple[list[MediaAsset], list[MediaAsset]]:
+        """Return (inline_images, deferred_assets) under the current image budget."""
+        candidates = filter_media_by_purpose(media, "for_model", default_source=source) if media else []
+        inline: list[MediaAsset] = []
+        deferred: list[MediaAsset] = []
+        total_bytes = 0
+
+        for asset in candidates:
+            if not asset.is_image:
+                deferred.append(asset)
+                continue
+            path = asset.preferred_path(for_model=True)
+            if not path or not Path(path).is_file():
+                deferred.append(asset)
+                continue
+            size_bytes = asset.size_bytes or 0
+            if len(inline) >= self._MAX_INLINE_IMAGES or total_bytes + size_bytes > self._MAX_INLINE_IMAGE_BYTES:
+                deferred.append(asset)
+                continue
+            inline.append(asset)
+            total_bytes += size_bytes
+
+        return inline, deferred
+
+    def _build_asset_summary_block(
+        self,
+        inline: list[MediaAsset],
+        deferred: list[MediaAsset],
+    ) -> dict[str, Any] | None:
+        """Build a textual companion block describing attached or deferred media."""
+        lines: list[str] = []
+        if inline:
+            lines.append("Attached images:")
+            lines.extend(f"- {self._describe_asset(asset)}" for asset in inline)
+        if deferred:
+            if lines:
+                lines.append("")
+            lines.append("Referenced assets kept as text history:")
+            lines.extend(f"- {asset.history_text()}" for asset in deferred)
+        if not lines:
+            return None
+        return {"type": "text", "text": "\n".join(lines)}
+
+    def _build_user_content(
+        self,
+        text: str,
+        media: list[MediaInput] | None,
+        *,
+        source: str = "channel",
+    ) -> str | list[dict[str, Any]]:
+        """Build user message content with image budget limits and textual asset summaries."""
         if not media:
             return text
 
-        images = []
-        for path in media:
+        images: list[dict[str, Any]] = []
+        inline_assets, deferred_assets = self._select_inline_assets(media, source=source)
+        for asset in inline_assets:
+            path = asset.preferred_path(for_model=True)
+            if not path:
+                continue
             p = Path(path)
             if not p.is_file():
                 continue
@@ -162,9 +234,23 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             b64 = base64.b64encode(raw).decode()
             images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
-        if not images:
+        summary_block = self._build_asset_summary_block(inline_assets, deferred_assets)
+        non_inline_assets = normalize_media_items(media, default_source=source)
+
+        if not images and not summary_block and not non_inline_assets:
             return text
-        return images + [{"type": "text", "text": text}]
+
+        blocks: list[dict[str, Any]] = []
+        blocks.extend(images)
+        if summary_block:
+            blocks.append(summary_block)
+        elif non_inline_assets:
+            blocks.append({
+                "type": "text",
+                "text": "\n".join(asset.history_text() for asset in non_inline_assets),
+            })
+        blocks.append({"type": "text", "text": text})
+        return blocks
 
     def add_tool_result(
         self, messages: list[dict[str, Any]],

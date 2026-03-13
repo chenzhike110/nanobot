@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 import uuid
 from typing import Any
 from urllib.parse import urljoin
@@ -9,7 +11,7 @@ from urllib.parse import urljoin
 import httpx
 import json_repair
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, LLMStreamEvent, ToolCallRequest
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
@@ -68,6 +70,36 @@ class AzureOpenAIProvider(LLMProvider):
             "api-key": self.api_key,  # Azure OpenAI uses api-key header, not Authorization
             "x-session-affinity": uuid.uuid4().hex,  # For cache locality
         }
+
+    @staticmethod
+    async def _iter_sse_json(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                yield json.loads(data)
+            except Exception:
+                continue
+
+    @staticmethod
+    def _accumulate_tool_call_delta(buffers: dict[int, dict[str, Any]], tool_delta: dict[str, Any]) -> None:
+        index = tool_delta.get("index")
+        try:
+            idx = int(index if index is not None else len(buffers))
+        except Exception:
+            idx = len(buffers)
+        buf = buffers.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+        if tool_delta.get("id"):
+            buf["id"] = tool_delta["id"]
+        function = tool_delta.get("function") or {}
+        if function.get("name"):
+            buf["name"] = function["name"]
+        if function.get("arguments"):
+            buf["arguments"] += function["arguments"]
 
     @staticmethod
     def _supports_temperature(
@@ -160,6 +192,92 @@ class AzureOpenAIProvider(LLMProvider):
                 content=f"Error calling Azure OpenAI: {repr(e)}",
                 finish_reason="error",
             )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        deployment_name = model or self.default_model
+        url = self._build_chat_url(deployment_name)
+        headers = self._build_headers()
+        payload = self._prepare_request_payload(
+            deployment_name, messages, tools, max_tokens, temperature, reasoning_effort,
+            tool_choice=tool_choice,
+        )
+        payload["stream"] = True
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_buffers: dict[int, dict[str, Any]] = {}
+        finish_reason = "stop"
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    if response.status_code != 200:
+                        text = await response.aread()
+                        yield LLMStreamEvent(
+                            kind="response",
+                            response=LLMResponse(
+                                content=f"Azure OpenAI API Error {response.status_code}: {text.decode('utf-8', 'ignore')}",
+                                finish_reason="error",
+                            ),
+                        )
+                        return
+                    async for event in self._iter_sse_json(response):
+                        choices = event.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        delta = choice.get("delta") or {}
+                        text_delta = delta.get("content")
+                        if isinstance(text_delta, str) and text_delta:
+                            content_parts.append(text_delta)
+                            yield LLMStreamEvent(kind="text_delta", delta=text_delta)
+                        reasoning_delta = delta.get("reasoning_content")
+                        if isinstance(reasoning_delta, str) and reasoning_delta:
+                            reasoning_parts.append(reasoning_delta)
+                            yield LLMStreamEvent(kind="reasoning_delta", delta=reasoning_delta)
+                        for tool_delta in delta.get("tool_calls") or []:
+                            if isinstance(tool_delta, dict):
+                                self._accumulate_tool_call_delta(tool_buffers, tool_delta)
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+        except Exception as e:
+            yield LLMStreamEvent(
+                kind="response",
+                response=LLMResponse(content=f"Error calling Azure OpenAI: {repr(e)}", finish_reason="error"),
+            )
+            return
+
+        tool_calls = []
+        for idx, buf in sorted(tool_buffers.items()):
+            raw_args = buf.get("arguments") or "{}"
+            try:
+                args = json_repair.loads(raw_args)
+            except Exception:
+                args = {"raw": raw_args}
+            tool_calls.append(ToolCallRequest(
+                id=buf.get("id") or f"call_{idx}",
+                name=buf.get("name") or "unknown_tool",
+                arguments=args,
+            ))
+
+        yield LLMStreamEvent(
+            kind="response",
+            response=LLMResponse(
+                content="".join(content_parts) or None,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                reasoning_content="".join(reasoning_parts).strip() or None,
+            ),
+        )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
         """Parse Azure OpenAI response into our standard format."""

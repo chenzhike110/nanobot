@@ -16,6 +16,7 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.base import ToolExecutionResult
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -25,7 +26,8 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.media.assets import MediaAsset, MediaInput, filter_media_by_purpose, normalize_media_items
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -162,7 +164,55 @@ class AgentLoop:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
             return None
-        return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
+        cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
+        cleaned = re.sub(r"^[\s\S]*?</think>", "", cleaned)
+        cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
+        cleaned = re.sub(r"</?think>", "", cleaned)
+        return cleaned.strip() or None
+
+    @staticmethod
+    def _extract_think(text: str | None) -> str | None:
+        """Extract <think>…</think> blocks from content when present."""
+        if not text:
+            return None
+        parts = re.findall(r"<think>([\s\S]*?)</think>", text)
+        if not parts:
+            return None
+        merged = "\n\n".join(part.strip() for part in parts if part and part.strip()).strip()
+        return merged or None
+
+    @staticmethod
+    def _extract_reasoning(
+        content: str | None,
+        reasoning_content: str | None = None,
+        thinking_blocks: list[dict] | None = None,
+    ) -> str | None:
+        """Collect reasoning text from provider-specific fields for optional UI display."""
+        parts: list[str] = []
+        if reasoning_content and reasoning_content.strip():
+            parts.append(reasoning_content.strip())
+        think = AgentLoop._extract_think(content)
+        if think:
+            parts.append(think)
+        if thinking_blocks:
+            for block in thinking_blocks:
+                if not isinstance(block, dict):
+                    continue
+                for key in ("thinking", "thought", "text", "content"):
+                    value = block.get(key)
+                    if isinstance(value, str) and value.strip():
+                        parts.append(value.strip())
+                        break
+        if not parts:
+            return None
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            if part not in seen:
+                deduped.append(part)
+                seen.add(part)
+        return "\n\n".join(deduped).strip() or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -175,34 +225,77 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _format_tool_result(tool_name: str, result: ToolExecutionResult) -> str:
+        """Render a tool result as text, including generated media references."""
+        content = (result.content or "").strip() or "(no output)"
+        media = normalize_media_items(result.media, default_source="tool")
+        if not media:
+            return content
+        lines = [content, "", f"Generated media from `{tool_name}`:"]
+        for asset in media:
+            audience = []
+            if asset.for_model:
+                audience.append("model")
+            if asset.for_user:
+                audience.append("user")
+            audience_text = f" -> {','.join(audience)}" if audience else ""
+            lines.append(f"- {asset.history_text()}{audience_text}")
+        return "\n".join(lines)
+
+    def _final_thinking_metadata(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Extract optional thinking metadata from the last assistant message."""
+        for entry in reversed(messages):
+            if entry.get("role") != "assistant":
+                continue
+            thinking = self._extract_reasoning(
+                entry.get("content"),
+                reasoning_content=entry.get("reasoning_content"),
+                thinking_blocks=entry.get("thinking_blocks"),
+            )
+            return {"_thinking": thinking} if thinking else {}
+        return {}
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+        on_stream: Callable[..., Awaitable[None]] | None = None,
+    ) -> tuple[str | None, list[str], list[dict], list[MediaAsset]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        outbound_media: list[MediaAsset] = []
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
-
-            response = await self.provider.chat_with_retry(
+            response = await self._chat_once(
                 messages=messages,
                 tools=tool_defs,
-                model=self.model,
+                on_stream=on_stream,
             )
 
             if response.has_tool_calls:
                 if on_progress:
                     thought = self._strip_think(response.content)
+                    reasoning = self._extract_reasoning(
+                        response.content,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    )
                     if thought:
-                        await on_progress(thought)
-                    await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                        await on_progress(thought, thinking=reasoning)
+                    elif reasoning:
+                        await on_progress("Thinking…", thinking=reasoning)
+                    await on_progress(
+                        self._tool_hint(response.tool_calls),
+                        tool_hint=True,
+                        thinking=reasoning,
+                    )
 
                 tool_call_dicts = [
                     tc.to_openai_tool_call()
@@ -214,14 +307,23 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
+                followup_media: list[MediaInput] = []
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = await self.tools.execute_with_result(tool_call.name, tool_call.arguments)
+                    followup_media.extend(filter_media_by_purpose(result.media, "for_model", default_source="tool"))
+                    outbound_media.extend(filter_media_by_purpose(result.media, "for_user", default_source="tool"))
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, tool_call.name, self._format_tool_result(tool_call.name, result)
                     )
+                if followup_media:
+                    messages.append(self.context.build_media_followup_message(
+                        "A tool generated images for follow-up analysis. Use them only if they help complete the task.",
+                        followup_media,
+                        source="tool",
+                    ))
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
@@ -244,7 +346,50 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, outbound_media
+
+    async def _chat_once(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_stream: Callable[..., Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Get one model response, optionally streaming deltas to the caller."""
+        if on_stream is None:
+            return await self.provider.chat_with_retry(
+                messages=messages,
+                tools=tools,
+                model=self.model,
+            )
+
+        response: LLMResponse | None = None
+        streamed_any = False
+        async for event in self.provider.chat_stream(
+            messages=messages,
+            tools=tools,
+            model=self.model,
+        ):
+            if event.kind == "text_delta" and event.delta:
+                streamed_any = True
+                await on_stream(event.delta, kind="text_delta")
+            elif event.kind == "reasoning_delta" and event.delta:
+                streamed_any = True
+                await on_stream(event.delta, kind="thinking_delta")
+            elif event.kind == "response" and event.response is not None:
+                response = event.response
+
+        if response is None:
+            response = await self.provider.chat_with_retry(
+                messages=messages,
+                tools=tools,
+                model=self.model,
+            )
+
+        if streamed_any and response.has_tool_calls:
+            await on_stream("", kind="reset")
+
+        return response
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -353,12 +498,17 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs, outbound_media = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=final_content or "Background task completed.",
+                media=outbound_media,
+                metadata=self._final_thinking_metadata(all_msgs),
+            )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -415,16 +565,43 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        async def _bus_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            thinking: str | None = None,
+        ) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if thinking:
+                meta["_thinking"] = thinking
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+        stream_id = f"{msg.chat_id}:{msg.timestamp.timestamp_ns() if hasattr(msg.timestamp, 'timestamp_ns') else int(msg.timestamp.timestamp() * 1_000_000_000)}"
+
+        async def _bus_stream(
+            content: str,
+            *,
+            kind: str,
+        ) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_stream"] = True
+            meta["_stream_kind"] = kind
+            meta["_stream_id"] = stream_id
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata=meta,
+            ))
+
+        final_content, _, all_msgs, outbound_media = await self._run_agent_loop(
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            on_stream=_bus_stream if msg.channel == "web" else None,
         )
 
         if final_content is None:
@@ -435,13 +612,26 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+            if outbound_media:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="",
+                    media=outbound_media,
+                    metadata=msg.metadata or {},
+                ))
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        final_meta = dict(msg.metadata or {})
+        final_meta.update(self._final_thinking_metadata(all_msgs))
         return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_content,
+            media=outbound_media,
+            metadata=final_meta,
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
@@ -464,14 +654,17 @@ class AgentLoop:
                         continue
                 if isinstance(content, list):
                     filtered = []
+                    saw_inline_image = False
                     for c in content:
                         if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                             continue  # Strip runtime context from multimodal messages
                         if (c.get("type") == "image_url"
                                 and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            filtered.append({"type": "text", "text": "[image]"})
+                            saw_inline_image = True
                         else:
                             filtered.append(c)
+                    if saw_inline_image and not filtered:
+                        filtered.append({"type": "text", "text": "[image]"})
                     if not filtered:
                         continue
                     entry["content"] = filtered

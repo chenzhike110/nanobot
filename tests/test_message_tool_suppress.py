@@ -107,12 +107,41 @@ class TestMessageToolSuppressLogic:
         async def on_progress(content: str, *, tool_hint: bool = False) -> None:
             progress.append((content, tool_hint))
 
-        final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+        final_content, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
 
         assert final_content == "Done"
         assert progress == [
             ("Visible", False),
             ('read_file("foo.txt")', True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_web_stream_publishes_deltas_and_final_message(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+
+        async def fake_stream(*args, **kwargs):
+            yield type("Event", (), {"kind": "text_delta", "delta": "Hel", "response": None})()
+            yield type("Event", (), {"kind": "text_delta", "delta": "lo", "response": None})()
+            yield type("Event", (), {"kind": "reasoning_delta", "delta": "think", "response": None})()
+            yield type("Event", (), {"kind": "response", "delta": None, "response": LLMResponse(content="Hello", tool_calls=[])})()
+
+        loop.provider.chat_stream = fake_stream
+        loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Hello", tool_calls=[]))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        published: list[OutboundMessage] = []
+        loop.bus.publish_outbound = AsyncMock(side_effect=lambda msg: published.append(msg))
+
+        msg = InboundMessage(channel="web", sender_id="user1", chat_id="chat123", content="Hi")
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        assert result.content == "Hello"
+        assert [m.content for m in published if m.metadata.get("_stream")] == ["Hel", "lo", "think"]
+        assert [m.metadata.get("_stream_kind") for m in published if m.metadata.get("_stream")] == [
+            "text_delta",
+            "text_delta",
+            "thinking_delta",
         ]
 
 

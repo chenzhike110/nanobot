@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from nanobot.agent.tools.mcp import MCPToolWrapper
+from nanobot.agent.tools.base import ToolExecutionResult
+from nanobot.media.assets import MediaAsset
 
 
 class _FakeTextContent:
@@ -97,3 +100,31 @@ async def test_execute_handles_generic_exception() -> None:
     result = await wrapper.execute()
 
     assert result == "(MCP tool call failed: RuntimeError)"
+
+
+@pytest.mark.asyncio
+async def test_execute_parses_structured_media_payload() -> None:
+    payload = {
+        "content": "generated image",
+        "media": [
+            {
+                "id": "asset_demo",
+                "kind": "image",
+                "purpose": "for_user",
+                "source": "mcp",
+                "path": "/tmp/demo.png",
+                "mime_type": "image/png",
+            }
+        ],
+    }
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        return SimpleNamespace(content=[_FakeTextContent(json.dumps(payload))])
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
+    result = await wrapper.execute()
+
+    assert isinstance(result, ToolExecutionResult)
+    assert result.content == "generated image"
+    assert isinstance(result.media[0], MediaAsset)
+    assert result.media[0].id == "asset_demo"

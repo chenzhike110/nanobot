@@ -211,6 +211,18 @@ class WecomConfig(Base):
     welcome_message: str = ""  # Welcome message for enter_chat event
 
 
+class WebConfig(Base):
+    """Built-in web channel configuration."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8765
+    allow_from: list[str] = Field(default_factory=lambda: ["*"])
+    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    max_upload_bytes: int = 10 * 1024 * 1024
+    static_title: str = "nanobot Web"
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
@@ -227,6 +239,7 @@ class ChannelsConfig(Base):
     qq: QQConfig = Field(default_factory=QQConfig)
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
     wecom: WecomConfig = Field(default_factory=WecomConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
 
 
 class AgentDefaults(Base):

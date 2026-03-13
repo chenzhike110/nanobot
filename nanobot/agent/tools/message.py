@@ -4,6 +4,7 @@ from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
+from nanobot.media.assets import MediaInput
 
 
 class MessageTool(Tool):
@@ -63,8 +64,13 @@ class MessageTool(Tool):
                 },
                 "media": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional: list of file paths to attach (images, audio, documents)"
+                    "items": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "object"},
+                        ]
+                    },
+                    "description": "Optional: attachment paths or structured media assets"
                 }
             },
             "required": ["content"]
@@ -76,7 +82,7 @@ class MessageTool(Tool):
         channel: str | None = None,
         chat_id: str | None = None,
         message_id: str | None = None,
-        media: list[str] | None = None,
+        media: list[MediaInput] | None = None,
         **kwargs: Any
     ) -> str:
         channel = channel or self._default_channel

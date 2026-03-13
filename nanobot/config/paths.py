@@ -24,6 +24,12 @@ def get_media_dir(channel: str | None = None) -> Path:
     return ensure_dir(base / channel) if channel else base
 
 
+def get_assets_dir(namespace: str | None = None) -> Path:
+    """Return the shared asset directory, optionally namespaced by source."""
+    base = get_runtime_subdir("assets")
+    return ensure_dir(base / namespace) if namespace else base
+
+
 def get_cron_dir() -> Path:
     """Return the cron storage directory."""
     return get_runtime_subdir("cron")

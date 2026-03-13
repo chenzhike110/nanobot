@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolExecutionResult
 
 
 class ToolRegistry:
@@ -35,13 +35,15 @@ class ToolRegistry:
         """Get all tool definitions in OpenAI format."""
         return [tool.to_schema() for tool in self._tools.values()]
 
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
-        """Execute a tool by name with given parameters."""
+    async def execute_with_result(self, name: str, params: dict[str, Any]) -> ToolExecutionResult:
+        """Execute a tool and preserve structured media artifacts when available."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
 
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+            return ToolExecutionResult(
+                content=f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+            )
 
         try:
             # Attempt to cast parameters to match schema types
@@ -50,13 +52,24 @@ class ToolRegistry:
             # Validate parameters
             errors = tool.validate_params(params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+                return ToolExecutionResult(
+                    content=f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+                )
             result = await tool.execute(**params)
-            if isinstance(result, str) and result.startswith("Error"):
-                return result + _HINT
-            return result
+            envelope = result if isinstance(result, ToolExecutionResult) else ToolExecutionResult(content=str(result))
+            if envelope.content.startswith("Error"):
+                return ToolExecutionResult(
+                    content=envelope.content + _HINT,
+                    media=envelope.media,
+                    metadata=envelope.metadata,
+                )
+            return envelope
         except Exception as e:
-            return f"Error executing {name}: {str(e)}" + _HINT
+            return ToolExecutionResult(content=f"Error executing {name}: {str(e)}" + _HINT)
+
+    async def execute(self, name: str, params: dict[str, Any]) -> str:
+        """Execute a tool by name with given parameters."""
+        return (await self.execute_with_result(name, params)).content
 
     @property
     def tool_names(self) -> list[str]:

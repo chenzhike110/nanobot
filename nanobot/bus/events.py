@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from nanobot.media.assets import MediaInput
+
 
 @dataclass
 class InboundMessage:
@@ -14,7 +16,7 @@ class InboundMessage:
     chat_id: str  # Chat/channel identifier
     content: str  # Message text
     timestamp: datetime = field(default_factory=datetime.now)
-    media: list[str] = field(default_factory=list)  # Media URLs
+    media: list[MediaInput] = field(default_factory=list)  # Paths or structured media assets
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     session_key_override: str | None = None  # Optional override for thread-scoped sessions
 
@@ -32,7 +34,7 @@ class OutboundMessage:
     chat_id: str
     content: str
     reply_to: str | None = None
-    media: list[str] = field(default_factory=list)
+    media: list[MediaInput] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

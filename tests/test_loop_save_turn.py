@@ -41,6 +41,28 @@ def test_save_turn_keeps_image_placeholder_after_runtime_strip() -> None:
     assert session.messages[0]["content"] == [{"type": "text", "text": "[image]"}]
 
 
+def test_save_turn_preserves_asset_summary_text_after_runtime_strip() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:image-summary")
+    runtime = ContextBuilder._RUNTIME_CONTEXT_TAG + "\nCurrent Time: now (UTC)"
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": runtime},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                {"type": "text", "text": "Attached images:\n- asset_demo (demo image)"},
+            ],
+        }],
+        skip=0,
+    )
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "Attached images:\n- asset_demo (demo image)"}
+    ]
+
+
 def test_save_turn_keeps_tool_results_under_16k() -> None:
     loop = _mk_loop()
     session = Session(key="test:tool-result")

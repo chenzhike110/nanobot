@@ -1,14 +1,17 @@
 """MCP client: connects to MCP servers and wraps their tools as native nanobot tools."""
 
 import asyncio
+import json
 from contextlib import AsyncExitStack
 from typing import Any
 
 import httpx
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import Tool, ToolExecutionResult
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.media.assets import normalize_media_items
+from nanobot.media.store import AssetStore
 
 
 class MCPToolWrapper(Tool):
@@ -16,11 +19,13 @@ class MCPToolWrapper(Tool):
 
     def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
         self._session = session
+        self._server_name = server_name
         self._original_name = tool_def.name
         self._name = f"mcp_{server_name}_{tool_def.name}"
         self._description = tool_def.description or tool_def.name
         self._parameters = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._tool_timeout = tool_timeout
+        self._asset_store = AssetStore()
 
     @property
     def name(self) -> str:
@@ -34,7 +39,49 @@ class MCPToolWrapper(Tool):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
-    async def execute(self, **kwargs: Any) -> str:
+    def _purpose_from_annotations(self, block: Any) -> str:
+        annotations = getattr(block, "annotations", None)
+        if isinstance(annotations, dict):
+            candidate = annotations.get("purpose") or annotations.get("audience")
+            if candidate in ("for_model", "for_user", "both"):
+                return candidate
+        return "for_model"
+
+    def _asset_from_block(self, block: Any):
+        mime_type = getattr(block, "mimeType", None) or getattr(block, "mime_type", None)
+        data = getattr(block, "data", None)
+        if not mime_type or not str(mime_type).startswith("image/") or data is None:
+            return None
+        purpose = self._purpose_from_annotations(block)
+        if isinstance(data, str):
+            return self._asset_store.write_base64(
+                data,
+                mime_type=mime_type,
+                source="mcp",
+                purpose=purpose,  # type: ignore[arg-type]
+                filename=f"{self._server_name}_{self._original_name}.bin",
+            )
+        if isinstance(data, (bytes, bytearray)):
+            return self._asset_store.write_bytes(
+                bytes(data),
+                mime_type=mime_type,
+                source="mcp",
+                purpose=purpose,  # type: ignore[arg-type]
+                filename=f"{self._server_name}_{self._original_name}.bin",
+            )
+        return None
+
+    @staticmethod
+    def _structured_text_result(text: str) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+        if isinstance(payload, dict) and ("content" in payload or "media" in payload):
+            return payload
+        return None
+
+    async def execute(self, **kwargs: Any) -> str | ToolExecutionResult:
         from mcp import types
 
         try:
@@ -63,12 +110,33 @@ class MCPToolWrapper(Tool):
             return f"(MCP tool call failed: {type(exc).__name__})"
 
         parts = []
+        media = []
         for block in result.content:
             if isinstance(block, types.TextContent):
                 parts.append(block.text)
             else:
-                parts.append(str(block))
-        return "\n".join(parts) or "(no output)"
+                asset = self._asset_from_block(block)
+                if asset is not None:
+                    media.append(asset)
+                else:
+                    parts.append(str(block))
+
+        text = "\n".join(parts) or "(no output)"
+        structured = self._structured_text_result(text)
+        if structured is not None:
+            structured_media = normalize_media_items(
+                structured.get("media"),
+                default_source="mcp",
+                default_purpose="for_model",
+            )
+            return ToolExecutionResult(
+                content=str(structured.get("content") or "(no output)"),
+                media=[*structured_media, *media],
+                metadata=dict(structured.get("metadata") or {}),
+            )
+        if media:
+            return ToolExecutionResult(content=text, media=media)
+        return text
 
 
 async def connect_mcp_servers(

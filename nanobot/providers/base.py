@@ -3,6 +3,7 @@
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +50,15 @@ class LLMResponse:
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
+
+
+@dataclass
+class LLMStreamEvent:
+    """Incremental stream event emitted while a response is generated."""
+
+    kind: str
+    delta: str | None = None
+    response: LLMResponse | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +193,32 @@ class LLMProvider(ABC):
             LLMResponse with content and/or tool calls.
         """
         pass
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """Best-effort streaming API.
+
+        Providers that do not support native streaming can fall back to a
+        single final response event.
+        """
+        response = await self.chat(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
+        )
+        yield LLMStreamEvent(kind="response", response=response)
 
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
