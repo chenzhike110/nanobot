@@ -38,6 +38,16 @@ app.innerHTML = `
         </div>
       </div>
     </footer>
+
+    <aside class="tool-panel">
+      <div class="tool-panel-header">
+        <span class="tool-panel-title">工具调用</span>
+        <button id="clearToolLog" class="ghost-btn tool-panel-clear" type="button">清除</button>
+      </div>
+      <div id="toolLogList" class="tool-log-list">
+        <div class="tool-log-empty">暂无工具调用记录</div>
+      </div>
+    </aside>
   </div>
 `
 
@@ -53,6 +63,8 @@ const els = {
   reloadBtn: document.querySelector('#reloadBtn'),
   sendBtn: document.querySelector('#sendBtn'),
   status: document.querySelector('#status'),
+  toolLogList: document.querySelector('#toolLogList'),
+  clearToolLog: document.querySelector('#clearToolLog'),
 }
 
 const state = {
@@ -69,8 +81,10 @@ const state = {
   progress: {
     textParts: [],
     toolHints: [],
+    toolResults: [],
     thinkingParts: [],
   },
+  toolCallLogs: [],  // persists across turns: [{id, name, args, result, status, time}]
 }
 
 marked.setOptions({
@@ -86,6 +100,7 @@ function resetProgressState() {
   state.progress = {
     textParts: [],
     toolHints: [],
+    toolResults: [],
     thinkingParts: [],
   }
 }
@@ -144,19 +159,45 @@ function messageDomId(item) {
 
 function renderAssets(media = []) {
   if (!media.length) return ''
-  return `
+  const audioItems = media.filter((a) => {
+    const kind = String(a.kind || '')
+    const mime = String(a.mime_type || a.mimeType || '')
+    return kind === 'audio' || mime.startsWith('audio/')
+  })
+  const otherItems = media.filter((a) => {
+    const kind = String(a.kind || '')
+    const mime = String(a.mime_type || a.mimeType || '')
+    return !(kind === 'audio' || mime.startsWith('audio/'))
+  })
+  const audioHtml = audioItems.map((asset) => {
+    const url = asset.web_url || asset.webUrl || ''
+    if (!url) return ''
+    return `
+      <div class="asset-audio-player">
+        <div class="audio-icon">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+            <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/>
+          </svg>
+        </div>
+        <audio class="audio-el" controls preload="auto" src="${url}"></audio>
+      </div>
+    `
+  }).join('')
+  const gridHtml = otherItems.length ? `
     <div class="media-grid">
-      ${media.map((asset) => {
+      ${otherItems.map((asset) => {
         const label = escapeHtml(asset.caption || asset.id || 'image')
-        if ((asset.mime_type || '').startsWith('image/') && asset.web_url) {
+        const mime = String(asset.mime_type || asset.mimeType || '')
+        const url = asset.web_url || asset.webUrl || ''
+        if (mime.startsWith('image/') && url) {
           return `
-            <a class="asset-card" href="${asset.web_url}" target="_blank" rel="noreferrer">
-              <img src="${asset.web_url}" alt="${label}" loading="lazy" />
+            <a class="asset-card" href="${url}" target="_blank" rel="noreferrer">
+              <img src="${url}" alt="${label}" loading="lazy" />
               <div class="asset-caption">${label}</div>
             </a>
           `
         }
-        const href = asset.web_url || '#'
+        const href = url || '#'
         return `
           <a class="asset-card asset-file" href="${href}" target="_blank" rel="noreferrer">
             <div class="asset-caption">${label}</div>
@@ -164,7 +205,15 @@ function renderAssets(media = []) {
         `
       }).join('')}
     </div>
-  `
+  ` : ''
+  return audioHtml + gridHtml
+}
+
+function autoplayLatestAudio(container) {
+  const players = container.querySelectorAll('.audio-el')
+  if (!players.length) return
+  const last = players[players.length - 1]
+  last.play().catch(() => {})
 }
 
 function renderMessage(item) {
@@ -232,7 +281,16 @@ function renderLiveStreamCard() {
     `
     : ''
   const toolsHtml = state.progress.toolHints.length
-    ? `<div class="progress-tools"><span class="progress-label">工具</span>${state.progress.toolHints.map((hint) => `<code>${escapeHtml(hint)}</code>`).join('')}</div>`
+    ? `<div class="progress-tools"><span class="progress-label">工具</span>${state.progress.toolHints.map((hint, i) => {
+        const res = state.progress.toolResults[i]
+        const isError = res && (res.startsWith('(MCP tool call') || res.startsWith('Error') || res.startsWith('(no output)'))
+        const badge = res == null
+          ? ''
+          : isError
+            ? `<span class="tool-result tool-result-err" title="${escapeHtml(res)}">✗</span>`
+            : `<details class="tool-result-detail"><summary class="tool-result tool-result-ok">✓</summary><pre class="tool-result-body">${escapeHtml(res)}</pre></details>`
+        return `<span class="tool-call-wrap"><code>${escapeHtml(hint)}</code>${badge}</span>`
+      }).join('')}</div>`
     : ''
   const summary = state.liveStream.content
     ? renderMarkdown(state.liveStream.content)
@@ -302,7 +360,16 @@ function renderProgressCard() {
     ? escapeHtml(state.progress.textParts.join('\n'))
     : (hasThinking ? '思考中...' : '正在处理你的请求...')
   const toolsHtml = hasTools
-    ? `<div class="progress-tools"><span class="progress-label">工具</span>${state.progress.toolHints.map((hint) => `<code>${escapeHtml(hint)}</code>`).join('')}</div>`
+    ? `<div class="progress-tools"><span class="progress-label">工具</span>${state.progress.toolHints.map((hint, i) => {
+        const res = state.progress.toolResults[i]
+        const isError = res && (res.startsWith('(MCP tool call') || res.startsWith('Error') || res.startsWith('(no output)'))
+        const badge = res == null
+          ? ''
+          : isError
+            ? `<span class="tool-result tool-result-err" title="${escapeHtml(res)}">✗</span>`
+            : `<details class="tool-result-detail"><summary class="tool-result tool-result-ok">✓</summary><pre class="tool-result-body">${escapeHtml(res)}</pre></details>`
+        return `<span class="tool-call-wrap"><code>${escapeHtml(hint)}</code>${badge}</span>`
+      }).join('')}</div>`
     : ''
   const thinkingHtml = hasThinking
     ? `
@@ -354,6 +421,29 @@ async function appendMessages(messages, replace = false) {
       const thinking = stripThinkArtifacts(item.metadata?._thinking || '')
       if (item.metadata?._tool_hint) {
         uniquePush(state.progress.toolHints, item.content || '')
+        // Record in tool call log if we have a tool name
+        if (item.metadata._tool_name) {
+          state.toolCallLogs.push({
+            id: `tcl-${Date.now()}-${state.toolCallLogs.length}`,
+            name: item.metadata._tool_name,
+            args: item.metadata._tool_args || {},
+            result: null,
+            status: 'running',
+            time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          })
+          renderToolPanel()
+        }
+      } else if (item.metadata?._tool_result) {
+        state.progress.toolResults.push(item.content || '')
+        // Pair result with last pending entry
+        const pending = [...state.toolCallLogs].reverse().find((e) => e.result === null)
+        if (pending) {
+          const res = item.content || '(no output)'
+          const isErr = res.startsWith('(MCP tool call') || res.startsWith('Error') || res.startsWith('(no output)')
+          pending.result = res
+          pending.status = isErr ? 'error' : 'ok'
+          renderToolPanel()
+        }
       } else {
         uniquePush(state.progress.textParts, stripThinkArtifacts(item.content || ''))
       }
@@ -374,6 +464,11 @@ async function appendMessages(messages, replace = false) {
       existing.outerHTML = html
     } else {
       els.messages.insertAdjacentHTML('beforeend', html)
+      // auto-play audio only for incoming assistant messages (not on history reload)
+      if (!replace && (item.role || 'assistant') !== 'user' && item.media?.length) {
+        const inserted = document.getElementById(messageDomId(item))
+        if (inserted) autoplayLatestAudio(inserted)
+      }
     }
   }
 

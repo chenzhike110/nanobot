@@ -2,11 +2,30 @@
 
 import asyncio
 import json
+import mimetypes
 from contextlib import AsyncExitStack
 from typing import Any
 
 import httpx
 from loguru import logger
+
+# mimetypes.guess_extension is unreliable on Linux (e.g. audio/wav → None).
+# Keep a minimal explicit map so assets get sensible file extensions.
+_MIME_TO_EXT: dict[str, str] = {
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/aac": ".aac",
+    "audio/webm": ".webm",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+}
 
 from nanobot.agent.tools.base import Tool, ToolExecutionResult
 from nanobot.agent.tools.registry import ToolRegistry
@@ -41,34 +60,70 @@ class MCPToolWrapper(Tool):
 
     def _purpose_from_annotations(self, block: Any) -> str:
         annotations = getattr(block, "annotations", None)
+        if annotations is None:
+            return "for_model"
+        # dict form (custom/legacy)
         if isinstance(annotations, dict):
-            candidate = annotations.get("purpose") or annotations.get("audience")
-            if candidate in ("for_model", "for_user", "both"):
-                return candidate
+            raw = annotations.get("purpose") or annotations.get("audience")
+        else:
+            # Pydantic model (mcp types.Annotations)
+            raw = getattr(annotations, "audience", None)
+        if isinstance(raw, str):
+            if raw in ("for_model", "for_user", "both"):
+                return raw
+        elif isinstance(raw, list):
+            roles = {str(r).lower() for r in raw}
+            has_user = "user" in roles
+            has_assistant = "assistant" in roles
+            if has_user and has_assistant:
+                return "both"
+            if has_user:
+                return "for_user"
+            if has_assistant:
+                return "for_model"
         return "for_model"
 
     def _asset_from_block(self, block: Any):
         mime_type = getattr(block, "mimeType", None) or getattr(block, "mime_type", None)
         data = getattr(block, "data", None)
-        if not mime_type or not str(mime_type).startswith("image/") or data is None:
+        if not mime_type or data is None:
+            return None
+        mime_type = str(mime_type)
+        if not (
+            mime_type.startswith("image/")
+            or mime_type.startswith("audio/")
+            or mime_type.startswith("video/")
+            or mime_type == "application/octet-stream"
+        ):
             return None
         purpose = self._purpose_from_annotations(block)
+        # Derive kind and a proper file extension so the web server can
+        # serve the file with the correct Content-Type.
+        if mime_type.startswith("image/"):
+            kind = "image"
+        elif mime_type.startswith("audio/"):
+            kind = "audio"
+        elif mime_type.startswith("video/"):
+            kind = "video"
+        else:
+            kind = None
+        ext = (
+            _MIME_TO_EXT.get(mime_type)
+            or mimetypes.guess_extension(mime_type, strict=False)
+            or ""
+        )
+        filename = f"{self._server_name}_{self._original_name}{ext}"
+        kwargs: dict[str, Any] = dict(
+            mime_type=mime_type,
+            source="mcp",
+            purpose=purpose,  # type: ignore[arg-type]
+            filename=filename,
+            kind=kind,  # type: ignore[arg-type]
+        )
         if isinstance(data, str):
-            return self._asset_store.write_base64(
-                data,
-                mime_type=mime_type,
-                source="mcp",
-                purpose=purpose,  # type: ignore[arg-type]
-                filename=f"{self._server_name}_{self._original_name}.bin",
-            )
+            return self._asset_store.write_base64(data, **kwargs)
         if isinstance(data, (bytes, bytearray)):
-            return self._asset_store.write_bytes(
-                bytes(data),
-                mime_type=mime_type,
-                source="mcp",
-                purpose=purpose,  # type: ignore[arg-type]
-                filename=f"{self._server_name}_{self._original_name}.bin",
-            )
+            return self._asset_store.write_bytes(bytes(data), **kwargs)
         return None
 
     @staticmethod

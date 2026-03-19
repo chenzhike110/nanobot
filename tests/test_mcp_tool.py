@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sys
 from types import ModuleType, SimpleNamespace
@@ -31,6 +32,13 @@ def _make_wrapper(session: object, *, timeout: float = 0.1) -> MCPToolWrapper:
         inputSchema={"type": "object", "properties": {}},
     )
     return MCPToolWrapper(session, "test", tool_def, tool_timeout=timeout)
+
+
+class _FakeBinaryContent:
+    def __init__(self, *, mimeType: str, data: str, annotations: dict | None = None) -> None:
+        self.mimeType = mimeType
+        self.data = data
+        self.annotations = annotations or {}
 
 
 @pytest.mark.asyncio
@@ -128,3 +136,28 @@ async def test_execute_parses_structured_media_payload() -> None:
     assert result.content == "generated image"
     assert isinstance(result.media[0], MediaAsset)
     assert result.media[0].id == "asset_demo"
+
+
+@pytest.mark.asyncio
+async def test_execute_converts_audio_block_to_media_asset() -> None:
+    audio_b64 = base64.b64encode(b"RIFF....WAVE").decode("utf-8")
+
+    async def call_tool(_name: str, arguments: dict) -> object:
+        return SimpleNamespace(
+            content=[
+                _FakeTextContent("ok"),
+                _FakeBinaryContent(
+                    mimeType="audio/wav",
+                    data=audio_b64,
+                    annotations={"audience": "for_user"},
+                ),
+            ]
+        )
+
+    wrapper = _make_wrapper(SimpleNamespace(call_tool=call_tool))
+    result = await wrapper.execute()
+
+    assert isinstance(result, ToolExecutionResult)
+    assert result.content == "ok"
+    assert len(result.media) == 1
+    assert result.media[0].kind == "audio"

@@ -291,11 +291,16 @@ class AgentLoop:
                         await on_progress(thought, thinking=reasoning)
                     elif reasoning:
                         await on_progress("Thinking…", thinking=reasoning)
-                    await on_progress(
-                        self._tool_hint(response.tool_calls),
-                        tool_hint=True,
-                        thinking=reasoning,
-                    )
+                    # Send one hint event per tool so the right panel can record
+                    # name + args individually.
+                    for tc in response.tool_calls:
+                        await on_progress(
+                            self._tool_hint([tc]),
+                            tool_hint=True,
+                            thinking=reasoning,
+                            tool_name=tc.name,
+                            tool_args=tc.arguments if isinstance(tc.arguments, dict) else {},
+                        )
 
                 tool_call_dicts = [
                     tc.to_openai_tool_call()
@@ -313,6 +318,9 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute_with_result(tool_call.name, tool_call.arguments)
+                    if on_progress:
+                        result_preview = (result.content or "(no output)")[:500]
+                        await on_progress(result_preview, tool_result=True)
                     followup_media.extend(filter_media_by_purpose(result.media, "for_model", default_source="tool"))
                     outbound_media.extend(filter_media_by_purpose(result.media, "for_user", default_source="tool"))
                     messages = self.context.add_tool_result(
@@ -571,11 +579,20 @@ class AgentLoop:
             content: str,
             *,
             tool_hint: bool = False,
+            tool_result: bool = False,
+            tool_name: str | None = None,
+            tool_args: dict | None = None,
             thinking: str | None = None,
         ) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if tool_result:
+                meta["_tool_result"] = True
+            if tool_name:
+                meta["_tool_name"] = tool_name
+            if tool_args is not None:
+                meta["_tool_args"] = tool_args
             if thinking:
                 meta["_thinking"] = thinking
             await self.bus.publish_outbound(OutboundMessage(
@@ -607,7 +624,7 @@ class AgentLoop:
         )
 
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            final_content = "模型没有返回可用输出。请重试一次，或检查模型/网关日志。"
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)

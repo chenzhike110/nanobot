@@ -754,6 +754,41 @@ Simply send the command above to your nanobot (via CLI or any chat channel), and
 
 Config file: `~/.nanobot/config.json`
 
+### Tools
+
+#### TTS (Text-to-Speech) via Piper (local, free)
+
+nanobot can synthesize text into audio **locally** using [Piper](https://github.com/rhasspy/piper).
+
+- **Install**: make sure the `piper` CLI is available in `PATH` (or set `piperPath`). Download a Chinese `.onnx` model.
+- **Enable**: add this to `~/.nanobot/config.json` (merge into your existing config):
+
+```json
+{
+  "tools": {
+    "tts": {
+      "enabled": true,
+      "engine": "piper",
+      "piperPath": "piper",
+      "modelPath": "/absolute/path/to/zh_CN-voice.onnx",
+      "configPath": "",
+      "speakerId": null,
+      "outputFormat": "wav"
+    }
+  }
+}
+```
+
+- **Call (Web)**: when `channels.web.enabled=true`, you can call:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8765/tts" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id":"default","text":"你好，我可以把文字读出来。"}'
+```
+
+It returns `{ "asset": { ... "web_url": "/files/..." } }`. Open the Web UI and play the audio.
+
 ### Providers
 
 > [!TIP]
@@ -1011,6 +1046,37 @@ Use `toolTimeout` to override the default 30s per-call timeout for slow servers:
 ```
 
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
+
+#### Base Models MCP Gateway (SAM3 / FoundationPose / Piper)
+
+This repo includes a local stdio MCP server that wraps remote base-model services (as documented in `mcp/SERVICE.md`).
+
+Add this to your `~/.nanobot/config.json`:
+
+```json
+{
+  "tools": {
+    "mcpServers": {
+      "base-models": {
+        "command": "python",
+        "args": ["-m", "nanobot.mcp_servers.base_models_server"],
+        "env": {
+          "NANOBOT_BASE_SAM3_URL": "http://localhost:16001",
+          "NANOBOT_BASE_FOUNDATIONPOSE_URL": "http://localhost:16030",
+          "NANOBOT_BASE_PIPER_URL": "http://localhost:16060"
+        },
+        "toolTimeout": 120
+      }
+    }
+  }
+}
+```
+
+Tools exposed:
+
+- `mcp_base-models_sam3_segment`: returns an **overlay image** (purpose=both) and **mask file paths** in text.
+- `mcp_base-models_foundationpose_initialize` / `mcp_base-models_foundationpose_track`: returns pose text + an axes overlay image (for_user).
+- `mcp_base-models_piper_tts`: returns WAV audio (for_user).
 
 
 

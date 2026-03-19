@@ -64,6 +64,10 @@ dev = [
     "mistune>=3.0.0,<4.0.0",
     "nh3>=0.2.17,<1.0.0",
 ]
+mcp_base_models = [
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
+]
 
 [project.scripts]
 nanobot = "nanobot.cli.commands:app"
