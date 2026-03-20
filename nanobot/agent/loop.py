@@ -17,9 +17,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.base import ToolExecutionResult
-from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from nanobot.agent.tools.message import MessageTool
+# from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -99,6 +97,7 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._mcp_ready = asyncio.Event()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
         self.memory_consolidator = MemoryConsolidator(
@@ -115,8 +114,6 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
-            self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
@@ -125,10 +122,7 @@ class AgentLoop:
         ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
-        if self.cron_service:
-            self.tools.register(CronTool(self.cron_service))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -403,6 +397,7 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        self._mcp_ready.set()
         logger.info("Agent loop started")
 
         while self._running:
@@ -562,10 +557,10 @@ class AgentLoop:
             )
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+        # self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        # if message_tool := self.tools.get("message"):
+        #     if isinstance(message_tool, MessageTool):
+        #         message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
         initial_messages = self.context.build_messages(
@@ -630,16 +625,16 @@ class AgentLoop:
         self.sessions.save(session)
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            if outbound_media:
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="",
-                    media=outbound_media,
-                    metadata=msg.metadata or {},
-                ))
-            return None
+        # if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        #     if outbound_media:
+        #         await self.bus.publish_outbound(OutboundMessage(
+        #             channel=msg.channel,
+        #             chat_id=msg.chat_id,
+        #             content="",
+        #             media=outbound_media,
+        #             metadata=msg.metadata or {},
+        #         ))
+        #     return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)

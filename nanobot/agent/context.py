@@ -75,9 +75,9 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
-        return f"""# nanobot 🐈
+        return f"""# 途零机器人
 
-You are nanobot, a helpful AI assistant.
+You are 途零机器人, 一个目前智能化程度不高但是很有潜力的机器人大脑.
 
 ## Runtime
 {runtime}
@@ -161,6 +161,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     @staticmethod
     def _describe_asset(asset: MediaAsset) -> str:
         label = asset.caption or asset.vision_summary or asset.ocr_text or asset.id
+        path = asset.preferred_path(for_model=True)
+        if path:
+            return f"{asset.id} ({label}) [path: {path}]"
         return f"{asset.id} ({label})"
 
     def _select_inline_assets(self, media: list[MediaInput] | None, *, source: str) -> tuple[list[MediaAsset], list[MediaAsset]]:

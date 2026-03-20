@@ -7,11 +7,12 @@ import json
 import mimetypes
 import queue
 import threading
+import time
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
@@ -45,6 +46,23 @@ class WebChannel(BaseChannel):
         self._subscriber_lock = threading.Lock()
         self._next_event_id = 0
         self._data_dir = get_data_dir().resolve()
+        # Optional callback to expose current tool definitions to the web UI.
+        # Signature: () -> list[dict[str, Any]]
+        self._tools_getter: Callable[[], list[dict[str, Any]]] | None = None
+        # Optional callback to expose latest camera preview payload.
+        # Signature: (camera_id: str, max_age_ms: int) -> dict[str, Any] | None
+        self._camera_preview_getter: Callable[[str, int], dict[str, Any] | None] | None = None
+
+    def set_tools_getter(self, getter: Callable[[], list[dict[str, Any]]]) -> None:
+        """Inject a callable that returns current tool definitions for /tools."""
+        self._tools_getter = getter
+
+    def set_camera_preview_getter(
+        self,
+        getter: Callable[[str, int], dict[str, Any] | None],
+    ) -> None:
+        """Inject a callable that returns latest camera preview payload."""
+        self._camera_preview_getter = getter
 
     def _cors_origin(self) -> str:
         origins = self.config.cors_origins or ["*"]
@@ -139,6 +157,21 @@ class WebChannel(BaseChannel):
             media=[self._serialize_asset(asset) for asset in assets if asset.for_user],
             metadata=msg.metadata,
         )
+
+    def _serialize_camera_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        asset_payload = payload.get("asset")
+        media: list[dict[str, Any]] = []
+        if isinstance(asset_payload, dict):
+            try:
+                media.append(self._serialize_asset(MediaAsset(**asset_payload)))
+            except Exception:
+                media.append(dict(asset_payload))
+        return {
+            "camera_id": payload.get("camera_id"),
+            "frame_id": payload.get("frame_id"),
+            "captured_at": payload.get("captured_at"),
+            "media": media,
+        }
 
     def _serialize_inbound(
         self,
@@ -346,6 +379,68 @@ class WebChannel(BaseChannel):
                             "max_upload_bytes": channel.config.max_upload_bytes,
                         },
                     )
+                    return
+                if parsed.path == "/tools":
+                    # Expose current tool definitions (if available) to the web UI.
+                    if channel._tools_getter is None:
+                        channel._send_json(self, HTTPStatus.NOT_FOUND, {"error": "tools endpoint not configured"})
+                        return
+                    try:
+                        tools = channel._tools_getter() or []
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.error("Web channel /tools getter failed: {}", exc)
+                        channel._send_json(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "failed to load tools"})
+                        return
+                    channel._send_json(self, HTTPStatus.OK, {"tools": tools})
+                    return
+                if parsed.path == "/camera/latest":
+                    if channel._camera_preview_getter is None:
+                        channel._send_json(self, HTTPStatus.NOT_FOUND, {"error": "camera preview endpoint not configured"})
+                        return
+                    qs = parse_qs(parsed.query)
+                    camera_id = str((qs.get("camera_id") or [""])[0]).strip()
+                    max_age_ms = int((qs.get("max_age_ms") or ["500"])[0] or "500")
+                    if not camera_id:
+                        channel._send_json(self, HTTPStatus.BAD_REQUEST, {"error": "camera_id is required"})
+                        return
+                    payload = channel._camera_preview_getter(camera_id, max_age_ms=max_age_ms)
+                    if payload is None:
+                        channel._send_json(self, HTTPStatus.NOT_FOUND, {"error": "no fresh frame"})
+                        return
+                    channel._send_json(self, HTTPStatus.OK, channel._serialize_camera_preview(payload))
+                    return
+                if parsed.path == "/camera/events":
+                    if channel._camera_preview_getter is None:
+                        channel._send_json(self, HTTPStatus.NOT_FOUND, {"error": "camera preview endpoint not configured"})
+                        return
+                    qs = parse_qs(parsed.query)
+                    camera_id = str((qs.get("camera_id") or [""])[0]).strip()
+                    max_age_ms = int((qs.get("max_age_ms") or ["500"])[0] or "500")
+                    if not camera_id:
+                        channel._send_json(self, HTTPStatus.BAD_REQUEST, {"error": "camera_id is required"})
+                        return
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.send_header("Access-Control-Allow-Origin", channel._cors_origin())
+                    self.end_headers()
+                    last_frame_id = -1
+                    try:
+                        while channel._running:
+                            payload = channel._camera_preview_getter(camera_id, max_age_ms=max_age_ms)
+                            if payload is not None:
+                                frame_id = int(payload.get("frame_id") or 0)
+                                if frame_id > last_frame_id:
+                                    channel._write_sse(self, channel._serialize_camera_preview(payload))
+                                    last_frame_id = frame_id
+                            else:
+                                self.wfile.write(b": waiting fresh frame\n\n")
+                                self.wfile.flush()
+                            time.sleep(0.2)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
                     return
                 if parsed.path.startswith("/assets/"):
                     channel._send_frontend_asset(self, parsed.path.lstrip("/"))

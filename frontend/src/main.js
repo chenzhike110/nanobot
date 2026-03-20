@@ -16,6 +16,17 @@ app.innerHTML = `
       </label>
     </header>
 
+    <section class="camera-preview-shell">
+      <div class="camera-preview-controls">
+        <input id="cameraIdInput" placeholder="Camera ID (serial)" autocomplete="off" />
+        <button id="cameraConnectBtn" class="ghost-btn" type="button">连接预览</button>
+        <span id="cameraStatus" class="status">相机预览未连接</span>
+      </div>
+      <div class="camera-preview-frame-wrap">
+        <img id="cameraPreviewImg" class="camera-preview-frame" alt="camera preview" />
+      </div>
+    </section>
+
     <main class="feed-shell">
       <div id="messages" class="messages"></div>
       <div id="emptyState" class="empty-state">发送一条消息，或先上传多张图片开始对话。</div>
@@ -65,6 +76,10 @@ const els = {
   status: document.querySelector('#status'),
   toolLogList: document.querySelector('#toolLogList'),
   clearToolLog: document.querySelector('#clearToolLog'),
+  cameraIdInput: document.querySelector('#cameraIdInput'),
+  cameraConnectBtn: document.querySelector('#cameraConnectBtn'),
+  cameraStatus: document.querySelector('#cameraStatus'),
+  cameraPreviewImg: document.querySelector('#cameraPreviewImg'),
 }
 
 const state = {
@@ -85,6 +100,13 @@ const state = {
     thinkingParts: [],
   },
   toolCallLogs: [],  // persists across turns: [{id, name, args, result, status, time}]
+  availableTools: [], // from /tools: [{ type, function: { name, description, parameters } }]
+  camera: {
+    id: '',
+    source: null,
+    pollTimer: null,
+    frameId: 0,
+  },
 }
 
 marked.setOptions({
@@ -340,6 +362,71 @@ function applyStreamEvent(item) {
   }
 }
 
+function renderToolPanel() {
+  if (!els.toolLogList) return
+  const items = [...state.toolCallLogs].reverse()
+  const callsHtml = items.length
+    ? items.map((entry) => {
+    const statusClass = entry.status === 'ok' ? 'tl-ok'
+      : entry.status === 'error' ? 'tl-err'
+      : 'tl-running'
+    const statusIcon = entry.status === 'ok' ? '✓'
+      : entry.status === 'error' ? '✗'
+      : '…'
+    // Trim long tool names (mcp_base-models_piper_tts → piper_tts)
+    const shortName = entry.name.replace(/^mcp_[^_]+_/, '')
+    const argsJson = JSON.stringify(entry.args, null, 2)
+    const resultHtml = entry.result
+      ? `<details class="tl-section">
+           <summary>返回值</summary>
+           <pre class="tl-pre">${escapeHtml(entry.result)}</pre>
+         </details>`
+      : ''
+    return `
+      <div class="tool-log-entry ${statusClass}">
+        <div class="tl-header">
+          <span class="tl-icon">${statusIcon}</span>
+          <span class="tl-name" title="${escapeHtml(entry.name)}">${escapeHtml(shortName)}</span>
+          <span class="tl-time">${entry.time}</span>
+        </div>
+        <details class="tl-section" open>
+          <summary>参数</summary>
+          <pre class="tl-pre">${escapeHtml(argsJson)}</pre>
+        </details>
+        ${resultHtml}
+      </div>
+    `
+    }).join('')
+    : '<div class="tool-log-empty">暂无工具调用记录</div>'
+
+  let toolsHtml = ''
+  if (Array.isArray(state.availableTools) && state.availableTools.length) {
+    toolsHtml = `
+      <div class="tool-available-wrap">
+        <details class="tool-available" open>
+          <summary>可用工具（${state.availableTools.length}）</summary>
+          <ul class="tool-available-list">
+            ${state.availableTools.map((tool) => {
+              const fn = tool.function || {}
+              const name = String(fn.name || '')
+              const shortName = name.replace(/^mcp_[^_]+_/, '')
+              const desc = String(fn.description || '').trim()
+              return `
+                <li class="tool-available-item">
+                  <div class="tool-available-name" title="${escapeHtml(name)}">${escapeHtml(shortName)}</div>
+                  ${desc ? `<div class="tool-available-desc">${escapeHtml(desc)}</div>` : ''}
+                </li>
+              `
+            }).join('')}
+          </ul>
+        </details>
+      </div>
+    `
+  }
+
+  els.toolLogList.innerHTML = toolsHtml + callsHtml
+}
+
 function renderProgressCard() {
   const existing = document.getElementById('message-progress-live')
   if (hasLiveStreamCard()) {
@@ -514,6 +601,83 @@ async function loadConfig() {
   els.appTitle.textContent = state.title
 }
 
+async function loadTools() {
+  try {
+    const data = await fetchJson('/tools')
+    state.availableTools = Array.isArray(data.tools) ? data.tools : []
+  } catch {
+    state.availableTools = []
+  } finally {
+    renderToolPanel()
+  }
+}
+
+function setCameraStatus(text) {
+  if (els.cameraStatus) {
+    els.cameraStatus.textContent = text
+  }
+}
+
+function clearCameraStream() {
+  if (state.camera.source) {
+    state.camera.source.close()
+    state.camera.source = null
+  }
+  if (state.camera.pollTimer) {
+    window.clearTimeout(state.camera.pollTimer)
+    state.camera.pollTimer = null
+  }
+}
+
+function renderCameraPayload(payload) {
+  const media = payload?.media || []
+  const image = media.find((item) => String(item.mime_type || item.mimeType || '').startsWith('image/'))
+  const url = image?.web_url || image?.webUrl
+  if (!url) return
+  els.cameraPreviewImg.src = `${url}?_t=${Date.now()}`
+  state.camera.frameId = Number(payload.frame_id || state.camera.frameId || 0)
+  setCameraStatus(`实时预览中 frame=${state.camera.frameId}`)
+}
+
+async function pollCameraLatest(cameraId) {
+  try {
+    const data = await fetchJson(`/camera/latest?camera_id=${encodeURIComponent(cameraId)}&max_age_ms=1000`)
+    renderCameraPayload(data)
+  } catch (error) {
+    setCameraStatus(error.message || '相机预览轮询失败')
+  } finally {
+    state.camera.pollTimer = window.setTimeout(() => pollCameraLatest(cameraId), 800)
+  }
+}
+
+function connectCameraPreview(cameraId) {
+  clearCameraStream()
+  if (!cameraId) {
+    setCameraStatus('请输入 camera id')
+    return
+  }
+  state.camera.id = cameraId
+  els.cameraPreviewImg.removeAttribute('src')
+
+  if (window.EventSource) {
+    const source = new EventSource(`/camera/events?camera_id=${encodeURIComponent(cameraId)}&max_age_ms=1000`)
+    state.camera.source = source
+    source.onopen = () => setCameraStatus('相机流已连接')
+    source.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data)
+        renderCameraPayload(payload)
+      } catch {
+        setCameraStatus('相机流解析失败')
+      }
+    }
+    source.onerror = () => setCameraStatus('相机流中断，自动重连中...')
+  } else {
+    setCameraStatus('浏览器不支持 SSE，切换轮询')
+    pollCameraLatest(cameraId)
+  }
+}
+
 async function loadHistory() {
   const chatId = (els.chatId.value || 'default').trim() || 'default'
   state.activeChatId = chatId
@@ -523,6 +687,8 @@ async function loadHistory() {
   await appendMessages((data.messages || []).filter((item) => !(item.metadata && item.metadata._progress)), true)
   state.cursor = data.next_cursor || 0
   setStatus('历史已同步')
+  // Load tools after history so the right panel shows available tools (await to avoid race with MCP).
+  await loadTools()
 }
 
 function closeEventStream() {
@@ -682,6 +848,13 @@ els.reloadBtn.addEventListener('click', async () => {
   connectEventStream()
 })
 els.sendBtn.addEventListener('click', sendMessage)
+els.clearToolLog.addEventListener('click', () => {
+  state.toolCallLogs = []
+  renderToolPanel()
+})
+els.cameraConnectBtn.addEventListener('click', () => {
+  connectCameraPreview((els.cameraIdInput.value || '').trim())
+})
 els.chatId.addEventListener('change', async () => {
   await loadHistory()
   connectEventStream()
@@ -715,14 +888,19 @@ document.addEventListener('toggle', (event) => {
 }, true)
 
 async function bootstrap() {
+  renderToolPanel()
   try {
     await loadConfig()
     state.isNearBottom = true
+    await loadTools()
     await loadHistory()
     if (window.EventSource) {
       connectEventStream()
     } else {
       poll()
+    }
+    if ((els.cameraIdInput.value || '').trim()) {
+      connectCameraPreview((els.cameraIdInput.value || '').trim())
     }
   } catch (error) {
     setStatus(error.message || '初始化失败')

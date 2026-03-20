@@ -449,6 +449,25 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
+    # Wire web channel with a live tools getter so the frontend can
+    # display currently available tools (including MCP tools once connected).
+    try:
+        from nanobot.channels.web import WebChannel
+ 
+        web_ch = channels.get_channel("web")
+        if isinstance(web_ch, WebChannel):
+            web_ch.set_tools_getter(agent.tools.get_definitions)
+            try:
+                from nanobot.mcp_servers.base_models_server.observation import get_camera_preview_payload
+
+                web_ch.set_camera_preview_getter(get_camera_preview_payload)
+            except Exception:
+                # base model server dependencies may be unavailable on some hosts.
+                pass
+    except Exception:
+        # Web channel may be disabled or unavailable; fail gracefully.
+        pass
+
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
@@ -515,10 +534,12 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            agent_task = asyncio.create_task(agent.run())
+            try:
+                await asyncio.wait_for(agent._mcp_ready.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                pass
+            await asyncio.gather(agent_task, channels.start_all())
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
